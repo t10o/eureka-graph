@@ -126,11 +126,11 @@ function processDayHtmlFromString(html: string, day: string): {
             return null;
         }
         
-        // SeriesPointに変換
-        let series = toSeries(targetGraph);
-        
         // 実ゲーム数を抽出
-        const actualGames = extractActualGames(html);
+        const actualGames = parseActualGamesFromHtml(html);
+        
+        // SeriesPointに変換（実ゲーム数に合わせて再スケール）
+        let series = toSeries(targetGraph, actualGames);
         
         // 検閲フラグを検出
         const censorFlags = detectCensorFlags(targetGraph, series, actualGames);
@@ -140,7 +140,7 @@ function processDayHtmlFromString(html: string, day: string): {
         let extrapolatedPointsCount = 0;
         
         if (day === '2024-08-31') {
-            series = extrapolateAug31(series);
+            series = extrapolateAug31(series, 10073, -3000, 50);
             specialRuleApplied = true;
             extrapolatedPointsCount = series.filter(p => p.extrapolated).length;
         }
@@ -154,7 +154,9 @@ function processDayHtmlFromString(html: string, day: string): {
             censoredRight: censorFlags.censoredRight,
             censoredBottom: censorFlags.censoredBottom,
             specialRuleApplied,
-            extrapolatedPointsCount
+            extrapolatedPointsCount,
+            // 検閲日の検出（実ゲーム数 > 8000 なのにグラフは8000で打ち切り）
+            isCensoredRight: actualGames ? actualGames > 8000 && lastPoint.game < actualGames * 0.9 : false
         };
         
         return { day, series, summary };
@@ -172,6 +174,7 @@ import {
     toSeries, 
     detectCensorFlags, 
     extractActualGames,
+    parseActualGamesFromHtml,
     extrapolateAug31 
 } from '../../playgraph-utils.js';
 

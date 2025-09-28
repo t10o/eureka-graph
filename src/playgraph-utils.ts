@@ -1,4 +1,4 @@
-import { PlayGraph, SeriesPoint, CensorFlags } from './types.js';
+import type { PlayGraph, SeriesPoint, CensorFlags } from './types.js';
 
 /**
  * HTMLからPlayGraphのJSONブロックを抽出
@@ -49,13 +49,15 @@ export function selectTargetGraph(blocks: PlayGraph[]): PlayGraph | null {
 /**
  * PlayGraphをSeriesPointに変換（座標→値変換）
  */
-export function toSeries(pg: PlayGraph): SeriesPoint[] {
+export function toSeries(pg: PlayGraph, actualGames?: number): SeriesPoint[] {
     const { GRAPH_RECT, PLAY_INFO, PLAY_LOG } = pg;
     const { x, y, w, h } = GRAPH_RECT;
     const { total, min, max } = PLAY_INFO;
+    const scaleX = (actualGames ?? total) / total; // ★実ゲーム数に合わせて再スケール
 
     return PLAY_LOG.map(([px, py]) => {
-        const game = (px - x) / w * total;
+        const gx8000 = (px - x) / w * total;         // もともとの 0..8000 スケール
+        const game   = gx8000 * scaleX;              // ★実ゲーム数に合わせて伸縮
         const diff = max - (py - y) / h * (max - min);
         
         return {
@@ -194,6 +196,16 @@ export function extrapolateAug31(
 export function extractActualGames(html: string): number | undefined {
     const match = html.match(/<td class="cName">ゲーム数<\/td>\s*<td class="param">(\d+)G<\/td>/);
     return match ? parseInt(match[1]) : undefined;
+}
+
+/**
+ * HTML文字列から当日の実ゲーム数を抽出（例：「ゲーム数 3742G」）
+ */
+export function parseActualGamesFromHtml(html: string): number | undefined {
+    // 数字直後の G を拾う。全角/半角スペース対応
+    const m = html.match(/ゲーム数\s*([\d,]+)\s*G/);
+    if (!m) return undefined;
+    return Number(m[1].replace(/,/g, ""));
 }
 
 /**
