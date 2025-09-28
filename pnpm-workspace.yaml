@@ -1,0 +1,6 @@
+ignoredBuiltDependencies:
+  - canvas
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp

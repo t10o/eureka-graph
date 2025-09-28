@@ -1,11 +1,193 @@
 ---
 import Welcome from '../components/Welcome.astro';
 import Layout from '../layouts/Layout.astro';
-
-// Welcome to Astro! Wondering what to do next? Check out the Astro documentation at https://docs.astro.build
-// Don't want to use any of this? Delete everything in this file, the `assets`, `components`, and `layouts` directories, and start fresh.
 ---
 
-<Layout>
+<Layout title="マイスロ通算グラフ">
 	<Welcome />
+	
+	<div style="margin-top: 40px;">
+		<h2>マイスロ通算グラフ</h2>
+		<p>2023年12月から現在までの通算データを表示します</p>
+		
+		<div id="loading" style="text-align: center; padding: 20px;">
+			<p>データを読み込み中...</p>
+		</div>
+		
+		<div id="graph-container" style="display: none;">
+			<div class="play_graph_title">通算実戦データ</div>
+			<div class="play_graph">
+				<canvas id="cumulative_graph" width="800" height="400"></canvas>
+			</div>
+			
+			<div id="stats" style="margin-top: 20px; padding: 20px; background-color: #f5f5f5; border-radius: 8px;">
+				<h3>統計情報</h3>
+				<div id="stats-content"></div>
+			</div>
+		</div>
+		
+		<div id="error" style="display: none; color: red; text-align: center; padding: 20px;">
+			<p>データの読み込みに失敗しました</p>
+		</div>
+	</div>
 </Layout>
+
+<style>
+    .play_graph_title {
+        width: 96%;
+        margin: 4px auto 0;
+        font-size: 1.25em;
+        font-weight: bold;
+    }
+    
+    .play_graph {
+        width: 96%;
+        margin: 2px auto 16px;
+    }
+    
+    .play_graph canvas {
+        background-color: white;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        max-width: 100%;
+        height: auto;
+    }
+    
+    #stats {
+        font-family: monospace;
+    }
+    
+    .stat-item {
+        margin: 10px 0;
+        padding: 5px;
+        background-color: white;
+        border-radius: 4px;
+    }
+    
+    .stat-label {
+        font-weight: bold;
+        color: #333;
+    }
+    
+    .stat-value {
+        color: #666;
+        margin-left: 10px;
+    }
+</style>
+
+<script>
+    // Chart.jsのスクリプトを読み込み
+    const chartScript = document.createElement('script');
+    chartScript.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+    document.head.appendChild(chartScript);
+    
+    chartScript.onload = async () => {
+        try {
+            const response = await fetch('/api/cumulative-graph');
+            const result = await response.json();
+            
+            if (result.success) {
+                // グラフを表示
+                const graphContainer = document.getElementById('graph-container');
+                const loading = document.getElementById('loading');
+                
+                if (loading) loading.style.display = 'none';
+                if (graphContainer) graphContainer.style.display = 'block';
+                
+                // Chart.jsでグラフを描画
+                const canvas = document.getElementById('cumulative_graph') as HTMLCanvasElement;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+                
+                if (result.data && result.data.datasets) {
+                    const chartData = result.data;
+                    const maxX = chartData.maxX;
+                    
+                    new (window as any).Chart(ctx, {
+                        type: "line",
+                        data: {
+                            datasets: chartData.datasets
+                        },
+                        options: {
+                            parsing: false,
+                            spanGaps: false,              // null で線を切る場合は false のまま
+                            plugins: { legend: { display: true } },
+                            scales: {
+                                x: {
+                                    type: "linear",
+                                    min: 0,
+                                    max: maxX,
+                                    ticks: { stepSize: 2000, callback: (v: any) => `${v}G` },
+                                    title: { display: true, text: "ゲーム数 (G)" },
+                                },
+                                y: {
+                                    title: { display: true, text: "累積差枚 (枚)" },
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // 統計情報を表示
+                const statsContent = document.getElementById('stats-content');
+                if (!statsContent) return;
+                
+                if (result.points && result.points.length > 0) {
+                    const points = result.points;
+                    const lastPoint = points[points.length - 1];
+                    const totalGames = lastPoint.cumGame;
+                    const totalBalance = lastPoint.cumDiff;
+                    const base = points[0]?.cumDiff ?? 0;
+                    const normalizedBalance = totalBalance - base;
+                    
+                    statsContent.innerHTML = `
+                        <div class="stat-item">
+                            <span class="stat-label">総ゲーム数:</span>
+                            <span class="stat-value">${totalGames.toLocaleString()}G</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">総収支（正規化前）:</span>
+                            <span class="stat-value">${totalBalance.toLocaleString()}枚</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">総収支（正規化後）:</span>
+                            <span class="stat-value">${normalizedBalance.toLocaleString()}枚</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">データポイント数:</span>
+                            <span class="stat-value">${points.length}個</span>
+                        </div>
+                    `;
+                    
+                    // 8/31の特別処理情報を表示
+                    const aug31Summary = result.summaries?.find((s: any) => s.day === '2024-08-31');
+                    if (aug31Summary && aug31Summary.specialRuleApplied) {
+                        statsContent.innerHTML += `
+                            <div class="stat-item">
+                                <span class="stat-label">8/31外挿ポイント:</span>
+                                <span class="stat-value">${aug31Summary.extrapolatedPointsCount}個</span>
+                            </div>
+                        `;
+                    }
+                }
+            } else {
+                throw new Error(result.error || 'Unknown error');
+            }
+        } catch (error) {
+            console.error('Error loading data:', error);
+            const loading = document.getElementById('loading');
+            const errorDiv = document.getElementById('error');
+            if (loading) loading.style.display = 'none';
+            if (errorDiv) errorDiv.style.display = 'block';
+        }
+    };
+    
+    chartScript.onerror = () => {
+        console.error('Failed to load Chart.js script');
+        const loading = document.getElementById('loading');
+        const errorDiv = document.getElementById('error');
+        if (loading) loading.style.display = 'none';
+        if (errorDiv) errorDiv.style.display = 'block';
+    };
+</script>
