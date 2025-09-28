@@ -1,5 +1,198 @@
 ---
 import Layout from '../layouts/Layout.astro';
+import { fetchAllMonthlyData } from '../api/myslo.js';
+import { 
+    extractPlayGraphJsonBlocks, 
+    selectTargetGraph, 
+    toSeries, 
+    detectCensorFlags, 
+    parseActualGamesFromHtml,
+    extrapolateAug31 
+} from '../playgraph-utils.js';
+
+// buildCumulative関数（累積データの作り直し）
+type DayPoints = { day: string; points: { game: number; diff: number; extrapolated?: boolean }[] };
+
+function buildCumulative(daySeries: DayPoints[]) {
+    // 日付順に並べる
+    const days = [...daySeries].sort((a, b) => a.day.localeCompare(b.day));
+
+    const out: { x: number; y: number; day: string; extrapolated?: boolean }[] = [];
+    let cumGame = 0;   // 累積ゲーム数（前日終端を加算）
+    let offset  = 0;   // 累積差枚    （前日終端を加算）
+
+    for (const d of days) {
+        if (!d.points?.length) continue;
+
+        // 念のため日内を昇順ソート
+        d.points.sort((a,b)=>a.game-b.game);
+
+        // 日内の先頭を0起点にそろえる（日内 diff が絶対値なら、ここで日内オフセットを引く）
+        const dayBaseDiff = d.points[0].diff;
+        const dayStartGame = d.points[0].game;
+
+        for (const p of d.points) {
+            const x = cumGame + (p.game - dayStartGame);      // 累積ゲーム数
+            const y = offset   + (p.diff - dayBaseDiff);      // 累積差枚
+            out.push({ x, y, day: d.day, extrapolated: !!p.extrapolated });
+        }
+
+        // この日の終端でオフセットを更新
+        const last = d.points[d.points.length - 1];
+        cumGame += last.game - dayStartGame;                 // 今日ぶんを加算
+        offset  += last.diff - dayBaseDiff;                  // 今日ぶんを加算
+    }
+
+    // 縦軸のゼロ基準（最古を0）
+    const base = out[0]?.y ?? 0;
+    for (const p of out) p.y -= base;
+
+    // x・y の不正＆重複 x を除去
+    const seen = new Set<number>();
+    const clean: typeof out = [];
+    for (const p of out) {
+        if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+        const k = +p.x.toFixed(6);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        clean.push(p);
+    }
+    // 念のため昇順
+    clean.sort((a,b)=>a.x-b.x);
+    return clean;
+}
+
+// ビルド時にデータを取得
+let chartData: any = null;
+let points: any[] = [];
+let summaries: any[] = [];
+
+try {
+    // 全月次データを取得
+    const monthlyData = await fetchAllMonthlyData();
+    
+    // 各月のHTMLを処理して日別データを生成
+    const daySeriesData = [];
+    const summariesData = [];
+    const dayOrder = [];
+    
+    for (const monthData of monthlyData) {
+        // 月次データから日付を生成（仮想的な日付）
+        const dateStr = monthData.date.toISOString().split('T')[0];
+        
+        // HTMLを処理
+        const html = monthData.html;
+        
+        try {
+            // PlayGraphデータを抽出
+            const blocks = extractPlayGraphJsonBlocks(html);
+            if (blocks.length === 0) {
+                console.warn(`No PlayGraph data found for: ${dateStr}`);
+                continue;
+            }
+            
+            // 対象グラフを選択
+            const targetGraph = selectTargetGraph(blocks);
+            if (!targetGraph) {
+                console.warn(`No valid target graph found for: ${dateStr}`);
+                continue;
+            }
+            
+            // 実ゲーム数を抽出
+            const actualGames = parseActualGamesFromHtml(html);
+            
+            // SeriesPointに変換（実ゲーム数に合わせて再スケール）
+            let series = toSeries(targetGraph, actualGames);
+            
+            // 検閲フラグを検出
+            const censorFlags = detectCensorFlags(targetGraph, series, actualGames);
+            
+            // 8/31の特別扱い
+            let specialRuleApplied = false;
+            let extrapolatedPointsCount = 0;
+            
+            if (dateStr === '2024-08-31') {
+                series = extrapolateAug31(series, 10073, -3000, 50);
+                specialRuleApplied = true;
+                extrapolatedPointsCount = series.filter(p => p.extrapolated).length;
+            }
+            
+            // 日別データを追加
+            const points = series.map(s => ({
+                game: s.game,
+                diff: s.diff,
+                extrapolated: s.extrapolated
+            }));
+            daySeriesData.push({ day: dateStr, points });
+            
+            // サマリを作成
+            const lastPoint = series[series.length - 1];
+            const summary = {
+                day: dateStr,
+                lastDiff: lastPoint.diff,
+                actualGames,
+                censoredRight: censorFlags.censoredRight,
+                censoredBottom: censorFlags.censoredBottom,
+                specialRuleApplied,
+                extrapolatedPointsCount,
+                isCensoredRight: actualGames ? actualGames > 8000 && lastPoint.game < actualGames * 0.9 : false
+            };
+            summariesData.push(summary);
+            dayOrder.push(dateStr);
+            
+        } catch (error) {
+            console.error(`Error processing ${dateStr}:`, error);
+        }
+    }
+    
+    // 日付順にソート
+    dayOrder.sort();
+    summariesData.sort((a, b) => a.day.localeCompare(b.day));
+    
+    // buildCumulative関数で累積データを生成
+    points = buildCumulative(daySeriesData);
+    
+    // データ監査
+    for (let i = 1; i < points.length; i++) {
+        if (points[i].x < points[i-1].x) {
+            throw new Error(`xが後退: idx=${i} ${points[i-1].x} -> ${points[i].x}`);
+        }
+    }
+    console.log("OK: xは単調増加。最終x=", points.at(-1)?.x, "最終y=", points.at(-1)?.y);
+    
+    // X軸の最大値を2000の倍数に丸める
+    const maxX = Math.ceil((points.at(-1)?.x ?? 0) / 2000) * 2000;
+    
+    // Chart.js用のデータ形式に変換
+    chartData = {
+        datasets: [{
+            label: "累積収支",
+            data: points,               // {x, y, day, extrapolated?}
+            parsing: false,             // x/y をそのまま使う
+            showLine: true,             // 点だけになるのを防ぐ
+            borderWidth: 2,
+            pointRadius: 1.5,
+            pointHoverRadius: 2,
+            fill: false,
+            segment: {
+                // 外挿区間だけ破線
+                borderDash: (ctx: any) => {
+                    const a = ctx.p0?.raw as any, b = ctx.p1?.raw as any;
+                    return (a?.extrapolated || b?.extrapolated) ? [6,4] : undefined;
+                }
+            }
+        }],
+        maxX: maxX
+    };
+    
+    summaries = summariesData;
+    
+} catch (error) {
+    console.error('Error generating chart data:', error);
+    chartData = null;
+    points = [];
+    summaries = [];
+}
 ---
 
 <Layout title="マイスロ通算グラフ">
@@ -10,40 +203,60 @@ import Layout from '../layouts/Layout.astro';
 				<p class="hero-description">2023年12月から現在までの実戦データを可視化</p>
 			</div>
 			
-			<div id="loading" class="loading-state">
-				<div class="loading-spinner"></div>
-				<p class="loading-text">データを読み込み中...</p>
-			</div>
-			
-			<div id="graph-container" class="graph-container" style="display: none;">
-				<div class="graph-header">
-					<h3 class="graph-title">📈 累積収支グラフ</h3>
-					<div class="graph-legend">
-						<div class="legend-item">
-							<div class="legend-color real"></div>
-							<span>実データ</span>
+			{chartData ? (
+				<div id="graph-container" class="graph-container">
+					<div class="graph-header">
+						<h3 class="graph-title">📈 累積収支グラフ</h3>
+						<div class="graph-legend">
+							<div class="legend-item">
+								<div class="legend-color real"></div>
+								<span>実データ</span>
+							</div>
+							<div class="legend-item">
+								<div class="legend-color extrapolated"></div>
+								<span>外挿データ（8/31）</span>
+							</div>
 						</div>
-						<div class="legend-item">
-							<div class="legend-color extrapolated"></div>
-							<span>外挿データ（8/31）</span>
+					</div>
+					<div class="graph-wrapper">
+						<canvas id="cumulative_graph" width="800" height="400"></canvas>
+					</div>
+					
+					<div id="stats" class="stats-container">
+						<h3 class="stats-title">📋 統計情報</h3>
+						<div id="stats-content" class="stats-grid">
+							{points.length > 0 && (
+								<>
+									<div class="stat-item">
+										<span class="stat-label">総ゲーム数</span>
+										<span class="stat-value">{points[points.length - 1]?.x?.toLocaleString()}G</span>
+									</div>
+									<div class="stat-item">
+										<span class="stat-label">総収支（正規化後）</span>
+										<span class="stat-value">{points[points.length - 1]?.y?.toLocaleString()}枚</span>
+									</div>
+									<div class="stat-item">
+										<span class="stat-label">データポイント数</span>
+										<span class="stat-value">{points.length}個</span>
+									</div>
+									{summaries.find(s => s.day === '2024-08-31' && s.specialRuleApplied) && (
+										<div class="stat-item">
+											<span class="stat-label">8/31外挿ポイント</span>
+											<span class="stat-value">{summaries.find(s => s.day === '2024-08-31')?.extrapolatedPointsCount}個</span>
+										</div>
+									)}
+								</>
+							)}
 						</div>
 					</div>
 				</div>
-				<div class="graph-wrapper">
-					<canvas id="cumulative_graph" width="800" height="400"></canvas>
+			) : (
+				<div class="error-state">
+					<div class="error-icon">⚠️</div>
+					<h3 class="error-title">データの読み込みに失敗しました</h3>
+					<p class="error-description">データの取得または処理中にエラーが発生しました</p>
 				</div>
-				
-				<div id="stats" class="stats-container">
-					<h3 class="stats-title">📋 統計情報</h3>
-					<div id="stats-content" class="stats-grid"></div>
-				</div>
-			</div>
-			
-			<div id="error" class="error-state" style="display: none;">
-				<div class="error-icon">⚠️</div>
-				<h3 class="error-title">データの読み込みに失敗しました</h3>
-				<p class="error-description">しばらく時間をおいてから再度お試しください</p>
-			</div>
+			)}
 		</div>
 	</div>
 </Layout>
@@ -271,119 +484,49 @@ import Layout from '../layouts/Layout.astro';
 	}
 </style>
 
-<script>
+<script define:vars={{ chartData, points, summaries }}>
     // Chart.jsのスクリプトを読み込み
     const chartScript = document.createElement('script');
     chartScript.src = 'https://cdn.jsdelivr.net/npm/chart.js';
     document.head.appendChild(chartScript);
     
-    chartScript.onload = async () => {
-        try {
-            const response = await fetch('/api/cumulative-graph');
-            const result = await response.json();
+    chartScript.onload = () => {
+        if (chartData && chartData.datasets) {
+            // Chart.jsでグラフを描画
+            const canvas = document.getElementById('cumulative_graph');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
             
-            if (result.success) {
-                // グラフを表示
-                const graphContainer = document.getElementById('graph-container');
-                const loading = document.getElementById('loading');
-                
-                if (loading) loading.style.display = 'none';
-                if (graphContainer) graphContainer.style.display = 'block';
-                
-                // Chart.jsでグラフを描画
-                const canvas = document.getElementById('cumulative_graph') as HTMLCanvasElement;
-                if (!canvas) return;
-                const ctx = canvas.getContext('2d');
-                if (!ctx) return;
-                
-                if (result.data && result.data.datasets) {
-                    const chartData = result.data;
-                    const maxX = chartData.maxX;
-                    
-                    new (window as any).Chart(ctx, {
-                        type: "line",
-                        data: {
-                            datasets: chartData.datasets
+            const maxX = chartData.maxX;
+            
+            new Chart(ctx, {
+                type: "line",
+                data: {
+                    datasets: chartData.datasets
+                },
+                options: {
+                    parsing: false,
+                    spanGaps: false,              // null で線を切る場合は false のまま
+                    plugins: { legend: { display: true } },
+                    scales: {
+                        x: {
+                            type: "linear",
+                            min: 0,
+                            max: maxX,
+                            ticks: { stepSize: 2000, callback: (v) => `${v}G` },
+                            title: { display: true, text: "ゲーム数 (G)" },
                         },
-                        options: {
-                            parsing: false,
-                            spanGaps: false,              // null で線を切る場合は false のまま
-                            plugins: { legend: { display: true } },
-                            scales: {
-                                x: {
-                                    type: "linear",
-                                    min: 0,
-                                    max: maxX,
-                                    ticks: { stepSize: 2000, callback: (v: any) => `${v}G` },
-                                    title: { display: true, text: "ゲーム数 (G)" },
-                                },
-                                y: {
-                                    title: { display: true, text: "累積差枚 (枚)" },
-                                }
-                            }
+                        y: {
+                            title: { display: true, text: "累積差枚 (枚)" },
                         }
-                    });
-                }
-                
-                // 統計情報を表示
-                const statsContent = document.getElementById('stats-content');
-                if (!statsContent) return;
-                
-                if (result.points && result.points.length > 0) {
-                    const points = result.points;
-                    const lastPoint = points[points.length - 1];
-                    const totalGames = lastPoint.cumGame;
-                    const totalBalance = lastPoint.cumDiff;
-                    const base = points[0]?.cumDiff ?? 0;
-                    const normalizedBalance = totalBalance - base;
-                    
-                    statsContent.innerHTML = `
-                        <div class="stat-item">
-                            <span class="stat-label">総ゲーム数:</span>
-                            <span class="stat-value">${totalGames.toLocaleString()}G</span>
-                        </div>
-                        <div class="stat-item">
-                            <span class="stat-label">総収支（正規化前）:</span>
-                            <span class="stat-value">${totalBalance.toLocaleString()}枚</span>
-                        </div>
-                        <div class="stat-item">
-                            <span class="stat-label">総収支（正規化後）:</span>
-                            <span class="stat-value">${normalizedBalance.toLocaleString()}枚</span>
-                        </div>
-                        <div class="stat-item">
-                            <span class="stat-label">データポイント数:</span>
-                            <span class="stat-value">${points.length}個</span>
-                        </div>
-                    `;
-                    
-                    // 8/31の特別処理情報を表示
-                    const aug31Summary = result.summaries?.find((s: any) => s.day === '2024-08-31');
-                    if (aug31Summary && aug31Summary.specialRuleApplied) {
-                        statsContent.innerHTML += `
-                            <div class="stat-item">
-                                <span class="stat-label">8/31外挿ポイント:</span>
-                                <span class="stat-value">${aug31Summary.extrapolatedPointsCount}個</span>
-                            </div>
-                        `;
                     }
                 }
-            } else {
-                throw new Error(result.error || 'Unknown error');
-            }
-        } catch (error) {
-            console.error('Error loading data:', error);
-            const loading = document.getElementById('loading');
-            const errorDiv = document.getElementById('error');
-            if (loading) loading.style.display = 'none';
-            if (errorDiv) errorDiv.style.display = 'block';
+            });
         }
     };
     
     chartScript.onerror = () => {
         console.error('Failed to load Chart.js script');
-        const loading = document.getElementById('loading');
-        const errorDiv = document.getElementById('error');
-        if (loading) loading.style.display = 'none';
-        if (errorDiv) errorDiv.style.display = 'block';
     };
 </script>
